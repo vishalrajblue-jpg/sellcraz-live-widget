@@ -38,28 +38,27 @@ import kotlin.math.abs
 import kotlin.math.max
 
 /**
- * The floating bid widget. Runs as a foreground service so Android keeps it
- * alive while the user is inside Instagram.
+ * The floating card over Instagram. Follows a SHOW, so it moves to each new
+ * lot on its own. Two modes:
+ *   buyer: current lot, hold to bid the exact next valid amount
+ *   host:  current lot and top bid, hold for Next lot / Close lot / End show
  *
- * Safety rules built in (from the launch pre-mortem):
- *  - hold-to-bid, never a single tap
- *  - the amount bid is the one on screen when the hold started; if the price
- *    has moved, place_bid rejects it server-side
- *  - no bidding while data is stale (no fresh update for 4s)
- *  - countdown uses the server's clock, not the phone's
+ * Every action is a hold (never a tap), the amount bid is the one on screen
+ * when the hold started, and nothing can be pressed on stale data.
  */
 class OverlayService : Service() {
 
     companion object {
-        const val EXTRA_LOT_ID = "lot_id"
+        const val EXTRA_SHOW_ID = "show_id"
+        const val EXTRA_HOST = "host"
         const val ACTION_STOP = "com.sellcraz.livewidget.STOP"
         private const val CHANNEL_ID = "widget"
         private const val NOTIF_ID = 4201
         private const val POLL_MS = 1000L
         private const val STALE_MS = 4000L
-        private const val HOLD_MS = 650L
+        private const val HOLD_MS = 600L
 
-        private val CORAL = 0xFFFF5A36.toInt()
+        private val CORAL = 0xFFF05023.toInt()
         private val GREEN = 0xFF2ECC71.toInt()
         private val AMBER = 0xFFF5A623.toInt()
         private val RED = 0xFFFF4D4F.toInt()
@@ -75,20 +74,18 @@ class OverlayService : Service() {
     private lateinit var api: SupabaseApi
     private val main = Handler(Looper.getMainLooper())
     private val io = Executors.newSingleThreadExecutor()
-    private val bidIo = Executors.newSingleThreadExecutor()
+    private val actIo = Executors.newSingleThreadExecutor()
     private val imgIo = Executors.newSingleThreadExecutor()
 
-    private var lotId: String? = null
-    private var state: LotState? = null
+    private var showId: String? = null
+    private var isHost = false
+    private var state: WidgetState? = null
     private var lastOkAt = 0L
-    private var clockOffset: Long? = null
     private var fetchInFlight = false
-    private var bidInFlight = false
-    private var holding = false
+    private var actionInFlight = false
     private var loadedImageUrl: String? = null
     private val lotsIBidOn = HashSet<String>()
-    private var lastEndedFlag = false
-    private var lastStaleFlag = true
+    private var lastFlags = ""
 
     private var root: LinearLayout? = null
     private lateinit var params: WindowManager.LayoutParams
@@ -96,17 +93,30 @@ class OverlayService : Service() {
     private lateinit var bubblePrice: TextView
     private lateinit var bubbleTime: TextView
     private lateinit var card: LinearLayout
+    private lateinit var brand: TextView
     private lateinit var thumb: ImageView
     private lateinit var titleView: TextView
+    private lateinit var priceLabel: TextView
     private lateinit var priceView: TextView
     private lateinit var statusView: TextView
     private lateinit var timeView: TextView
-    private lateinit var bidButton: TextView
+    private lateinit var primaryBtn: TextView
+    private lateinit var secondaryBtn: TextView
     private lateinit var holdBar: ProgressBar
     private lateinit var msgView: TextView
-    private var holdAnim: ValueAnimator? = null
 
     private val inr: NumberFormat = NumberFormat.getInstance(Locale("en", "IN"))
+
+    // hold-to-act
+    private var holdingView: TextView? = null
+    private var holdAction: (() -> Unit)? = null
+    private var holdAnim: ValueAnimator? = null
+    private val holdComplete = Runnable {
+        val act = holdAction ?: return@Runnable
+        holdingView?.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        clearHold()
+        act()
+    }
 
     private val pollTick = object : Runnable {
         override fun run() {
@@ -114,22 +124,11 @@ class OverlayService : Service() {
             main.postDelayed(this, POLL_MS)
         }
     }
-
     private val clockTick = object : Runnable {
         override fun run() {
             renderClock()
             main.postDelayed(this, 250)
         }
-    }
-
-    private var holdAmount: Long = 0
-    private val holdComplete = Runnable {
-        if (!holding) return@Runnable
-        holding = false
-        holdAnim?.cancel()
-        holdBar.progress = 0
-        bidButton.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-        placeBid(holdAmount)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -151,14 +150,20 @@ class OverlayService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        val newLot = intent?.getStringExtra(EXTRA_LOT_ID) ?: prefs.lotId
-        if (newLot != lotId) {
-            lotId = newLot
+        val newShow = intent?.getStringExtra(EXTRA_SHOW_ID)
+        if (newShow == null) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        if (newShow != showId) {
+            showId = newShow
             state = null
             lastOkAt = 0L
             loadedImageUrl = null
         }
+        isHost = intent.getBooleanExtra(EXTRA_HOST, false)
         if (root == null) buildOverlay()
+        brand.text = if (isHost) "● YOUR SHOW  SellCraz" else "● LIVE  SellCraz"
         setExpanded(true)
         showMessage("Connecting…", WHITE70)
         render()
@@ -181,7 +186,7 @@ class OverlayService : Service() {
         }
         root = null
         io.shutdownNow()
-        bidIo.shutdownNow()
+        actIo.shutdownNow()
         imgIo.shutdownNow()
         super.onDestroy()
     }
@@ -189,29 +194,16 @@ class OverlayService : Service() {
     // ---------------------------------------------------------------- data
 
     private fun fetchNow() {
-        val id = lotId ?: return
+        val id = showId ?: return
         if (fetchInFlight) return
         fetchInFlight = true
         io.execute {
             try {
-                val f = api.fetchLot(id)
-                val s = LotState.from(f.json, prefs.defaultIncrement)
+                val s = api.widgetState(id)
                 main.post {
                     fetchInFlight = false
-                    if (id != lotId || root == null) return@post
-                    // Server Date header is truncated to the second and sent
-                    // before the response arrives, so every sample is a slight
-                    // underestimate. Keeping the max converges on the truth.
-                    f.serverTimeMs?.let { server ->
-                        val sample = server - f.localTimeMs
-                        clockOffset = clockOffset?.let { max(it, sample) } ?: sample
-                    }
-                    val first = state == null
-                    state = s
-                    lastOkAt = SystemClock.elapsedRealtime()
-                    if (first) showMessage("", WHITE70)
-                    render()
-                    maybeLoadImage(s.imageUrl)
+                    if (id != showId || root == null) return@post
+                    applyState(s)
                 }
             } catch (e: Exception) {
                 main.post {
@@ -224,25 +216,36 @@ class OverlayService : Service() {
         }
     }
 
-    private fun placeBid(amount: Long) {
-        val id = lotId ?: return
-        bidInFlight = true
-        showMessage("Placing ${money(amount)}…", WHITE70)
+    private fun applyState(s: WidgetState) {
+        val first = state == null
+        state = s
+        lastOkAt = SystemClock.elapsedRealtime()
+        if (first) showMessage("", WHITE70)
         render()
-        bidIo.execute {
+        maybeLoadImage(s.lot?.imageUrl)
+        if (s.showStatus == "ended") {
+            main.removeCallbacks(pollTick) // nothing more will happen
+        }
+    }
+
+    /** Runs an RPC off the main thread and reports the result on the card. */
+    private fun act(busyText: String, okText: String, call: () -> WidgetState?) {
+        actionInFlight = true
+        showMessage(busyText, WHITE70)
+        render()
+        actIo.execute {
             try {
-                api.placeBid(id, amount)
+                val s = call()
                 main.post {
-                    bidInFlight = false
-                    lotsIBidOn.add(id)
-                    showMessage("Bid placed: ${money(amount)} ✓", GREEN)
-                    render()
+                    actionInFlight = false
+                    showMessage(okText, GREEN)
+                    if (s != null) applyState(s) else render()
                     fetchNow()
                 }
             } catch (e: Exception) {
                 main.post {
-                    bidInFlight = false
-                    showMessage(e.message ?: "Bid failed", RED)
+                    actionInFlight = false
+                    showMessage(e.message ?: "Something went wrong", RED)
                     render()
                     fetchNow()
                 }
@@ -251,8 +254,12 @@ class OverlayService : Service() {
     }
 
     private fun maybeLoadImage(url: String?) {
-        if (url == null || url == loadedImageUrl) return
+        if (url == loadedImageUrl) return
         loadedImageUrl = url
+        if (url == null) {
+            thumb.visibility = View.GONE
+            return
+        }
         val size = dp(52)
         imgIo.execute {
             val bmp = ImageLoader.load(url, size * 2)
@@ -268,19 +275,74 @@ class OverlayService : Service() {
         }
     }
 
-    private fun isStale(): Boolean =
-        lastOkAt == 0L || SystemClock.elapsedRealtime() - lastOkAt > STALE_MS
+    private fun isStale() = lastOkAt == 0L || SystemClock.elapsedRealtime() - lastOkAt > STALE_MS
 
-    private fun remainingMs(endsAt: Long): Long =
-        endsAt - (System.currentTimeMillis() + (clockOffset ?: 0L))
+    private fun remainingMs(s: WidgetState, endsAt: Long) =
+        endsAt - (System.currentTimeMillis() + s.clockOffsetMs)
 
-    private fun ended(s: LotState): Boolean =
-        s.isClosedStatus || (s.endsAtMs != null && remainingMs(s.endsAtMs) <= 0)
+    private fun lotRunning(s: WidgetState): Boolean {
+        val l = s.lot ?: return false
+        return l.status == "active" && (l.endsAtMs == null || remainingMs(s, l.endsAtMs) > 0)
+    }
 
-    private fun canBid(): Boolean {
-        val s = state ?: return false
-        return prefs.accessToken != null && !isStale() && !ended(s) &&
-            s.nextBid != null && !bidInFlight
+    private fun lotExpired(s: WidgetState): Boolean {
+        val l = s.lot ?: return false
+        return l.status == "active" && l.endsAtMs != null && remainingMs(s, l.endsAtMs) <= 0
+    }
+
+    // ---------------------------------------------------------------- what the buttons do
+
+    private data class Btn(val label: String, val enabled: Boolean, val action: (() -> Unit)?)
+
+    private fun primaryButton(s: WidgetState?): Btn {
+        if (s == null) return Btn("Loading…", false, null)
+        if (s.showStatus == "ended") return Btn("Show ended", false, null)
+        if (isStale()) return Btn("Waiting for connection…", false, null)
+        if (actionInFlight) return Btn("Working…", false, null)
+        val id = s.showId
+
+        if (isHost) {
+            if (s.showStatus != "live") return Btn("Go live in SellCraz first", false, null)
+            if (!prefs.hasFreshSession(5_000)) return Btn("Session expired · tap ↗", false, null)
+            if (lotRunning(s)) return Btn("Lot running…", false, null)
+            if (s.queuedCount > 0) {
+                val label = if (s.lot == null) "HOLD: START FIRST LOT" else "HOLD: NEXT LOT"
+                return Btn(label, true) {
+                    act("Starting next lot…", "Next lot is live") { api.advanceLot(id) }
+                }
+            }
+            if (lotExpired(s)) {
+                return Btn("HOLD: CLOSE FINAL LOT", true) {
+                    act("Closing lot…", "Lot closed") { api.advanceLot(id) }
+                }
+            }
+            return Btn("HOLD: END SHOW", true) {
+                act("Ending show…", "Show ended") { api.endShow(id); null }
+            }
+        }
+
+        // buyer
+        val l = s.lot
+        if (l == null || !lotRunning(s)) return Btn("Waiting for the next lot", false, null)
+        if (!prefs.hasFreshSession(5_000)) return Btn("Log in to bid · tap ↗", false, null)
+        val amount = s.nextBid ?: return Btn("Price unknown", false, null)
+        return Btn("HOLD TO BID ${money(amount)}", true) {
+            val lotId = l.id
+            act("Placing ${money(amount)}…", "Bid placed: ${money(amount)} ✓") {
+                api.placeBid(lotId, amount)
+                lotsIBidOn.add(lotId)
+                null
+            }
+        }
+    }
+
+    private fun secondaryButton(s: WidgetState?): Btn? {
+        if (!isHost || s == null || isStale() || actionInFlight) return null
+        val l = s.lot ?: return null
+        if (!lotRunning(s) || !prefs.hasFreshSession(5_000)) return null
+        return Btn("Hold to close this lot now", true) {
+            act("Closing lot…", "Lot closed") { api.closeLotNow(l.id); null }
+        }
     }
 
     // ---------------------------------------------------------------- render
@@ -288,62 +350,92 @@ class OverlayService : Service() {
     private fun render() {
         if (root == null) return
         val s = state
-        val stale = isStale()
+        val l = s?.lot
+        val me = prefs.userId
 
-        if (s == null) {
-            titleView.text = if (lotId == null) "No lot selected" else "Loading lot…"
-            priceView.text = "–"
-            bubblePrice.text = "SC"
-            setStatus("", WHITE70)
-        } else {
-            titleView.text = s.title
-            val shown = s.currentBid ?: s.startPrice
-            priceView.text = shown?.let { money(it) } ?: "–"
-            bubblePrice.text = shown?.let { compact(it) } ?: "SC"
-            val mine = s.leaderId != null && s.leaderId == prefs.userId
-            val iBid = lotsIBidOn.contains(s.id) || lotsIBidOn.contains(lotId)
-            when {
-                ended(s) && mine -> setStatus("Auction ended · you won 🎉", GREEN)
-                ended(s) -> setStatus(if (s.isClosedStatus) "Auction ended" else "Time's up · settling", WHITE70)
-                stale -> setStatus("Reconnecting…", AMBER)
-                mine -> setStatus("You're winning", GREEN)
-                s.currentBid == null -> setStatus("No bids yet · be first", WHITE70)
-                iBid && s.leaderId != null -> setStatus("You've been outbid", RED)
-                else -> setStatus("Bidding open", WHITE70)
+        titleView.text = when {
+            s == null -> "Loading show…"
+            l == null -> s.title
+            else -> l.name
+        }
+
+        when {
+            l == null -> {
+                priceLabel.text = if (s?.nextLotName != null) "UP NEXT" else ""
+                priceView.text = s?.nextLotName ?: "–"
+                priceView.textSize = 18f
+                bubblePrice.text = "SC"
+            }
+            l.status == "active" -> {
+                val shown = if (l.currentBid > 0) l.currentBid else l.startingBid
+                priceLabel.text = if (l.currentBid > 0) "CURRENT BID" else "STARTING BID"
+                priceView.text = money(shown)
+                priceView.textSize = 30f
+                bubblePrice.text = compact(shown)
+            }
+            else -> {
+                priceLabel.text = if (l.status == "sold") "SOLD FOR" else "UNSOLD"
+                priceView.text = if (l.status == "sold") money(l.currentBid) else "–"
+                priceView.textSize = 30f
+                bubblePrice.text = if (l.status == "sold") compact(l.currentBid) else "SC"
             }
         }
 
+        val stale = isStale()
+        val leading = l != null && me != null && l.leaderId == me
+        when {
+            s == null -> setStatus("", WHITE70)
+            s.showStatus == "ended" -> setStatus("Show ended. Thanks for watching!", WHITE70)
+            stale -> setStatus("Reconnecting…", AMBER)
+            l == null -> setStatus(if (s.showStatus == "live") "Waiting for the first lot" else "Show hasn't started", WHITE70)
+            l.status == "sold" && me != null && l.winnerId == me -> setStatus("You won this lot 🎉", GREEN)
+            l.status == "sold" || l.status == "unsold" ->
+                setStatus(s.nextLotName?.let { "Up next: $it" } ?: "That was the last lot", WHITE70)
+            isHost -> setStatus(if (l.currentBid > 0) "Bidding is on" else "No bids yet", WHITE70)
+            leading -> setStatus("You're winning", GREEN)
+            l.currentBid == 0L -> setStatus("No bids yet · be first", WHITE70)
+            lotsIBidOn.contains(l.id) -> setStatus("You've been outbid", RED)
+            else -> setStatus("Bidding open", WHITE70)
+        }
+
         priceView.alpha = if (stale) 0.4f else 1f
-        val mine = s?.leaderId != null && s.leaderId == prefs.userId
         (bubble.background as GradientDrawable).setColor(
             when {
                 stale && s != null -> AMBER
-                mine -> GREEN
+                leading && !isHost -> GREEN
                 else -> CORAL
             }
         )
 
-        if (!holding) {
-            val ok = canBid()
-            bidButton.text = when {
-                prefs.accessToken == null -> "Sign in inside the app first"
-                s == null -> "Loading…"
-                ended(s) -> "Bidding closed"
-                stale -> "Waiting for connection…"
-                bidInFlight -> "Placing bid…"
-                s.nextBid == null -> "Price unknown"
-                else -> "HOLD TO BID ${money(s.nextBid!!)}"
+        if (holdingView == null) {
+            applyBtn(primaryBtn, primaryButton(s), CORAL)
+            val sec = secondaryButton(s)
+            if (sec == null) {
+                secondaryBtn.visibility = View.GONE
+            } else {
+                secondaryBtn.visibility = View.VISIBLE
+                applyBtn(secondaryBtn, sec, 0xFF3A3A40.toInt())
             }
-            (bidButton.background as GradientDrawable).setColor(if (ok) CORAL else GREY)
-            bidButton.alpha = if (ok) 1f else 0.8f
         }
         renderClock()
+    }
+
+    private fun applyBtn(v: TextView, b: Btn, color: Int) {
+        v.text = b.label
+        v.tag = b
+        (v.background as GradientDrawable).setColor(if (b.enabled) color else GREY)
+        v.alpha = if (b.enabled) 1f else 0.8f
     }
 
     private fun renderClock() {
         if (root == null) return
         val s = state
-        val rem = s?.endsAtMs?.let { remainingMs(it) }
+        val l = s?.lot
+        val rem = if (s != null && l != null && l.status == "active" && l.endsAtMs != null) {
+            remainingMs(s, l.endsAtMs)
+        } else {
+            null
+        }
         val short = when {
             rem == null -> ""
             rem <= 0 -> "0:00"
@@ -354,16 +446,16 @@ class OverlayService : Service() {
             rem <= 0 -> "Time's up"
             else -> "Ends in $short"
         }
+        timeView.visibility = if (rem == null) View.GONE else View.VISIBLE
         timeView.setTextColor(if (rem != null && rem in 1..10_000) RED else WHITE)
         bubbleTime.text = short
         bubbleTime.visibility = if (short.isEmpty()) View.GONE else View.VISIBLE
 
-        val nowEnded = s != null && ended(s)
-        val nowStale = isStale()
-        if (nowEnded != lastEndedFlag || nowStale != lastStaleFlag) {
-            lastEndedFlag = nowEnded
-            lastStaleFlag = nowStale
-            if (nowEnded || nowStale) cancelHold()
+        // Re-render when the timer or connection state crosses a line.
+        val flags = "${s?.let { lotRunning(it) }}|${isStale()}|${prefs.hasFreshSession(5_000)}"
+        if (flags != lastFlags) {
+            lastFlags = flags
+            cancelHold()
             render()
         }
     }
@@ -381,33 +473,47 @@ class OverlayService : Service() {
         msgView.visibility = if (t.isEmpty()) View.GONE else View.VISIBLE
     }
 
-    // ---------------------------------------------------------------- hold to bid
+    // ---------------------------------------------------------------- hold to act
 
-    private fun startHold() {
-        val amount = state?.nextBid ?: return
-        holdAmount = amount
-        holding = true
-        bidButton.text = "Keep holding… ${money(amount)}"
+    private fun startHold(v: TextView) {
+        val b = v.tag as? Btn ?: return
+        if (!b.enabled || b.action == null) return
+        holdingView = v
+        holdAction = b.action
+        v.text = "Keep holding…"
         holdAnim?.cancel()
         holdAnim = ValueAnimator.ofInt(0, 1000).apply {
             duration = HOLD_MS
             addUpdateListener { holdBar.progress = it.animatedValue as Int }
             start()
         }
-        // The bid is triggered by this timer, not the animation, so it still
-        // needs a real hold even if the phone has animations switched off.
+        // The timer fires the action, not the animation, so a real hold is
+        // needed even with the phone's animations switched off.
         main.removeCallbacks(holdComplete)
         main.postDelayed(holdComplete, HOLD_MS)
     }
 
-    private fun cancelHold() {
+    private fun clearHold() {
         main.removeCallbacks(holdComplete)
-        if (!holding) return
-        holding = false
         holdAnim?.cancel()
         holdAnim = null
         holdBar.progress = 0
+        holdingView = null
+        holdAction = null
+    }
+
+    private fun cancelHold() {
+        if (holdingView == null) return
+        clearHold()
         render()
+    }
+
+    private val holdTouch = View.OnTouchListener { v, e ->
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> startHold(v as TextView)
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> cancelHold()
+        }
+        true
     }
 
     // ---------------------------------------------------------------- views
@@ -415,7 +521,6 @@ class OverlayService : Service() {
     private fun buildOverlay() {
         val r = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        // Collapsed bubble
         bubble = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -432,7 +537,6 @@ class OverlayService : Service() {
         bubble.addView(bubbleTime)
         bubble.setOnTouchListener(dragHandler { setExpanded(true) })
 
-        // Expanded card
         card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(14), dp(10), dp(14), dp(14))
@@ -444,13 +548,13 @@ class OverlayService : Service() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
-        val brand = text(12f, WHITE70, true).apply {
-            text = "● LIVE  SellCraz"
+        brand = text(12f, WHITE70, true).apply {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             setPadding(0, dp(6), 0, dp(6))
         }
         brand.setOnTouchListener(dragHandler { })
         header.addView(brand)
+        header.addView(iconButton("↗") { openApp() })
         header.addView(iconButton("–") { setExpanded(false) })
         header.addView(iconButton("✕") { stopSelf() })
         card.addView(header)
@@ -476,31 +580,24 @@ class OverlayService : Service() {
         lotRow.addView(titleView)
         card.addView(lotRow)
 
-        card.addView(text(11f, WHITE50, true).apply {
-            text = "CURRENT BID"
+        priceLabel = text(11f, WHITE50, true).apply {
             letterSpacing = 0.08f
             setPadding(0, dp(10), 0, 0)
-        })
+        }
+        card.addView(priceLabel)
         priceView = text(30f, WHITE, true)
         card.addView(priceView)
         statusView = text(13f, WHITE70, true)
         card.addView(statusView)
-        timeView = text(13f, WHITE, false).apply { setPadding(0, dp(2), 0, dp(10)) }
+        timeView = text(13f, WHITE, false).apply { setPadding(0, dp(2), 0, 0) }
         card.addView(timeView)
 
-        bidButton = text(15f, WHITE, true).apply {
-            gravity = Gravity.CENTER
-            setPadding(dp(12), dp(14), dp(12), dp(14))
-            background = rounded(GREY, dp(12))
+        primaryBtn = actionButton(15f).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(10) }
         }
-        bidButton.setOnTouchListener { _, e ->
-            when (e.actionMasked) {
-                MotionEvent.ACTION_DOWN -> if (canBid()) startHold()
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> cancelHold()
-            }
-            true
-        }
-        card.addView(bidButton)
+        card.addView(primaryBtn)
 
         holdBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             isIndeterminate = false
@@ -512,6 +609,14 @@ class OverlayService : Service() {
             }
         }
         card.addView(holdBar)
+
+        secondaryBtn = actionButton(13f).apply {
+            visibility = View.GONE
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(8) }
+        }
+        card.addView(secondaryBtn)
 
         msgView = text(12f, WHITE70, false).apply {
             setPadding(0, dp(6), 0, 0)
@@ -536,6 +641,19 @@ class OverlayService : Service() {
         }
         wm.addView(r, params)
         root = r
+    }
+
+    private fun actionButton(size: Float) = text(size, WHITE, true).apply {
+        gravity = Gravity.CENTER
+        setPadding(dp(12), dp(13), dp(12), dp(13))
+        background = rounded(GREY, dp(12))
+        setOnTouchListener(holdTouch)
+    }
+
+    private fun openApp() {
+        val i = Intent(this, MainActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+        startActivity(i)
     }
 
     private fun setExpanded(expanded: Boolean) {
@@ -598,8 +716,8 @@ class OverlayService : Service() {
         )
         val n = Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setContentTitle("SellCraz bid widget is on")
-            .setContentText("Floating over your screen. Tap Stop to close it.")
+            .setContentTitle("SellCraz widget is on")
+            .setContentText("Floating over Instagram. Tap Stop to close it.")
             .setContentIntent(openPi)
             .setOngoing(true)
             .addAction(

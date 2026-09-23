@@ -7,19 +7,21 @@ plugins {
 val supabaseUrl = System.getenv("SUPABASE_URL")?.takeIf { it.isNotBlank() }
     ?: "https://gdrifmzygvzcolggwhwj.supabase.co"
 val supabaseAnonKey = System.getenv("SUPABASE_ANON_KEY")?.takeIf { it.isNotBlank() } ?: ""
+val siteUrl = System.getenv("SITE_URL")?.takeIf { it.isNotBlank() } ?: "https://www.sellcraz.com"
 
 android {
     namespace = "com.sellcraz.livewidget"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.sellcraz.livewidget"
+        applicationId = "com.sellcraz.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1-demo"
+        versionCode = 2
+        versionName = "0.2"
         buildConfigField("String", "SUPABASE_URL", "\"$supabaseUrl\"")
         buildConfigField("String", "SUPABASE_ANON_KEY", "\"$supabaseAnonKey\"")
+        buildConfigField("String", "SITE_URL", "\"$siteUrl\"")
     }
 
     buildFeatures {

@@ -1,328 +1,330 @@
 package com.sellcraz.livewidget
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
-import android.content.ClipboardManager
+import android.app.AlertDialog
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Typeface
+import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
-import android.text.InputType
-import android.util.TypedValue
-import android.widget.Button
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
+import android.view.ViewGroup
+import android.webkit.CookieManager
+import android.webkit.PermissionRequest
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Toast
+import java.util.concurrent.Executors
 
-/** Setup screen: connect, pick a lot, launch the floating widget. */
+/**
+ * The SellCraz app: the website in a WebView, plus the Instagram handoff.
+ *
+ * Whenever the page is a show (/show/<id>) the app checks show_widget_state.
+ * If the show's bidding venue is Instagram and it is live, the floating
+ * widget starts (seller controls for the host, bid button for everyone else)
+ * and the seller's Instagram opens. Everything else is the website as-is.
+ */
 class MainActivity : Activity() {
 
     private lateinit var prefs: Prefs
     private lateinit var api: SupabaseApi
-    private lateinit var col: LinearLayout
+    private lateinit var web: WebView
+    private val main = Handler(Looper.getMainLooper())
+    private val io = Executors.newSingleThreadExecutor()
 
-    private lateinit var urlIn: EditText
-    private lateinit var anonIn: EditText
-    private lateinit var emailIn: EditText
-    private lateinit var passIn: EditText
-    private lateinit var lotIn: EditText
-    private lateinit var tableIn: EditText
-    private lateinit var rpcIn: EditText
-    private lateinit var lotParamIn: EditText
-    private lateinit var amountParamIn: EditText
-    private lateinit var incIn: EditText
-    private lateinit var authStatus: TextView
-    private lateinit var lotStatus: TextView
-    private lateinit var rawView: TextView
+    private var currentShowId: String? = null
+    private val handedOff = HashSet<String>()
+    private var pendingHandoff: WidgetState? = null
+    private var fileCallback: ValueCallback<Array<Uri>>? = null
+    private var pendingWebPermission: PermissionRequest? = null
 
-    private val uuidRegex = Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+    private val showRegex = Regex("/show/([0-9a-fA-F-]{36})")
 
+    companion object {
+        private const val REQ_FILE = 11
+        private const val REQ_MEDIA = 12
+        private const val REQ_NOTIF = 13
+        private const val SHOW_POLL_MS = 3000L
+        private const val SESSION_SYNC_MS = 30_000L
+    }
+
+    private val showPoll = object : Runnable {
+        override fun run() {
+            checkShow()
+            main.postDelayed(this, SHOW_POLL_MS)
+        }
+    }
+
+    private val sessionSync = object : Runnable {
+        override fun run() {
+            SessionBridge.sync(prefs, web)
+            main.postDelayed(this, SESSION_SYNC_MS)
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
         api = SupabaseApi(prefs)
 
-        col = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(28), dp(18), dp(48))
-        }
-        setContentView(ScrollView(this).apply { addView(col) })
-
-        heading("SellCraz Live", 24f)
-        para("Demo build. A floating bid button that sits on top of Instagram Live.")
-
-        heading("1 · Connect", 18f)
-        urlIn = field("Supabase URL", prefs.supabaseUrl, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
-        anonIn = field("Supabase anon key", prefs.anonKey, InputType.TYPE_CLASS_TEXT)
-        emailIn = field(
-            "Email or phone", prefs.email ?: "",
-            InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
+        web = WebView(this)
+        web.layoutParams = ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
         )
-        buttonRow("Send code" to { sendCode() })
-        passIn = field("Login code", "", InputType.TYPE_CLASS_NUMBER)
-        buttonRow(
-            "Sign in" to { signIn() },
-            "Sign out" to { prefs.signOut(); updateAuthStatus() }
-        )
-        authStatus = para("")
-        updateAuthStatus()
+        setContentView(web)
 
-        heading("2 · Lot", 18f)
-        lotIn = field("Lot link or lot ID", prefs.lotId ?: "", InputType.TYPE_CLASS_TEXT)
-        buttonRow("Paste" to { pasteLot() }, "Test load" to { testLoad() })
-        lotStatus = para("")
-        rawView = para("").apply {
-            typeface = Typeface.MONOSPACE
-            textSize = 11f
-            setTextIsSelectable(true)
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)
+        web.settings.apply {
+            javaScriptEnabled = true
+            domStorageEnabled = true
+            mediaPlaybackRequiresUserGesture = false
+            // Lets the website tell it's inside the app, e.g. to hide an
+            // "install the app" banner later.
+            userAgentString = "$userAgentString SellCrazApp/1"
         }
-
-        heading("3 · Go live", 18f)
-        buttonRow("Start floating widget" to { startWidget() })
-        buttonRow("Open Instagram" to { openInstagram() }, "Stop widget" to { stopWidget() })
-
-        heading("Advanced · only if bids fail", 18f)
-        para("These must match the database. Test load shows what the app can read.")
-        tableIn = field("Lots table", prefs.lotTable, InputType.TYPE_CLASS_TEXT)
-        rpcIn = field("Bid function", prefs.rpcName, InputType.TYPE_CLASS_TEXT)
-        lotParamIn = field("Lot parameter name", prefs.lotParam, InputType.TYPE_CLASS_TEXT)
-        amountParamIn = field("Amount parameter name", prefs.amountParam, InputType.TYPE_CLASS_TEXT)
-        incIn = field(
-            "Default bid increment (₹) if the lot has none",
-            prefs.defaultIncrement.toString(), InputType.TYPE_CLASS_NUMBER
-        )
-        buttonRow("Save advanced" to { saveAdvanced(); toast("Saved") })
-
-        handleShare(intent)
-    }
-
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        handleShare(intent)
-    }
-
-    private fun handleShare(i: Intent?) {
-        if (i?.action == Intent.ACTION_SEND) {
-            i.getStringExtra(Intent.EXTRA_TEXT)?.let { lotIn.setText(it) }
-        }
-    }
-
-    // ---------------------------------------------------------------- actions
-
-    private fun saveConnection() {
-        prefs.supabaseUrl = urlIn.text.toString()
-        prefs.anonKey = anonIn.text.toString()
-    }
-
-    private fun saveAdvanced() {
-        prefs.lotTable = tableIn.text.toString()
-        prefs.rpcName = rpcIn.text.toString()
-        prefs.lotParam = lotParamIn.text.toString()
-        prefs.amountParam = amountParamIn.text.toString()
-        incIn.text.toString().toLongOrNull()?.let { prefs.defaultIncrement = it }
-    }
-
-    private fun identity(): String {
-        val t = emailIn.text.toString().trim()
-        if (t.contains('@')) return t
-        val digits = t.filter { it.isDigit() }
-        return when {
-            digits.length == 10 -> "+91$digits"
-            digits.length == 12 && digits.startsWith("91") -> "+$digits"
-            else -> t
-        }
-    }
-
-    private fun sendCode() {
-        saveConnection()
-        val id = identity()
-        if (id.isEmpty()) {
-            toast("Enter your email or phone")
-            return
-        }
-        authStatus.text = "Sending code…"
-        Thread {
-            try {
-                api.sendOtp(id)
-                runOnUiThread { authStatus.text = "Code sent to $id. Enter it above and tap Sign in." }
-            } catch (e: Exception) {
-                runOnUiThread { authStatus.text = "Couldn't send code: ${e.message}" }
-            }
-        }.start()
-    }
-
-    private fun signIn() {
-        saveConnection()
-        val id = identity()
-        val code = passIn.text.toString().trim()
-        if (id.isEmpty() || code.isEmpty()) {
-            toast("Enter your email or phone and the code")
-            return
-        }
-        authStatus.text = "Signing in…"
-        Thread {
-            try {
-                api.verifyOtp(id, code)
-                runOnUiThread {
-                    passIn.setText("")
-                    updateAuthStatus()
-                }
-            } catch (e: Exception) {
-                runOnUiThread { authStatus.text = "Sign-in failed: ${e.message}" }
-            }
-        }.start()
-    }
-
-    private fun updateAuthStatus() {
-        authStatus.text = if (prefs.accessToken != null) {
-            "Signed in as ${prefs.email ?: "?"}  (user ${prefs.userId?.take(8) ?: "?"}…)"
-        } else {
-            "Not signed in. The widget can show prices but can't bid."
-        }
-    }
-
-    private fun extractLotId(raw: String): String? {
-        val t = raw.trim()
-        if (t.isEmpty()) return null
-        uuidRegex.find(t)?.let { return it.value }
-        if (t.contains('/')) {
-            return t.substringBefore('?').trimEnd('/').substringAfterLast('/').takeIf { it.isNotEmpty() }
-        }
-        return t
-    }
-
-    private fun pasteLot() {
-        val cm = getSystemService(ClipboardManager::class.java)
-        val txt = cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
-        if (txt.isNullOrBlank()) toast("Clipboard is empty") else lotIn.setText(txt)
-    }
-
-    private fun testLoad() {
-        saveConnection()
-        saveAdvanced()
-        val id = extractLotId(lotIn.text.toString())
-        if (id == null) {
-            toast("Enter a lot link or ID")
-            return
-        }
-        prefs.lotId = id
-        lotStatus.text = "Loading lot $id…"
-        rawView.text = ""
-        Thread {
-            try {
-                val f = api.fetchLot(id)
-                val s = LotState.from(f.json, prefs.defaultIncrement)
-                runOnUiThread {
-                    lotStatus.text = s.describe()
-                    rawView.text = "Raw row from the database (screenshot this for Claude if something looks off):\n\n" +
-                        f.json.toString(2)
-                }
-            } catch (e: Exception) {
-                runOnUiThread { lotStatus.text = "Couldn't load lot: ${e.message}" }
-            }
-        }.start()
-    }
-
-    private fun startWidget() {
-        saveConnection()
-        saveAdvanced()
-        val id = extractLotId(lotIn.text.toString())
-        if (id == null) {
-            toast("Enter a lot link or ID first")
-            return
-        }
-        prefs.lotId = id
+        web.webViewClient = ShellClient()
+        web.webChromeClient = ShellChrome()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 7)
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIF)
         }
 
+        if (savedInstanceState != null) {
+            web.restoreState(savedInstanceState)
+        } else {
+            web.loadUrl(startUrl(intent))
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        intent.data?.let { web.loadUrl(startUrl(intent)) }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        web.saveState(outState)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        main.post(sessionSync)
+        onUrl(web.url)
+        // Came back from the overlay settings screen with a handoff waiting.
+        pendingHandoff?.let { s ->
+            if (Settings.canDrawOverlays(this)) {
+                pendingHandoff = null
+                handoff(s)
+            }
+        }
+    }
+
+    override fun onPause() {
+        main.removeCallbacks(sessionSync)
+        main.removeCallbacks(showPoll)
+        CookieManager.getInstance().flush()
+        super.onPause()
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (web.canGoBack()) web.goBack() else super.onBackPressed()
+    }
+
+    private fun startUrl(i: Intent?): String {
+        val d = i?.data
+        return if (d != null && d.host?.endsWith(Uri.parse(prefs.siteUrl).host ?: "") == true) {
+            d.toString()
+        } else {
+            prefs.siteUrl
+        }
+    }
+
+    // ---------------------------------------------------------------- show detection
+
+    private fun onUrl(url: String?) {
+        val id = url?.let { showRegex.find(it)?.groupValues?.get(1) }
+        currentShowId = id
+        main.removeCallbacks(showPoll)
+        if (id != null) main.post(showPoll)
+    }
+
+    /** Polls while a show page is open, so "Go live" is caught without a navigation. */
+    private fun checkShow() {
+        val id = currentShowId ?: return
+        if (handedOff.contains(id)) return
+        io.execute {
+            val s = try {
+                api.widgetState(id)
+            } catch (e: Exception) {
+                null
+            } ?: return@execute
+            main.post {
+                if (id != currentShowId || handedOff.contains(id)) return@post
+                if (s.isInstagram && s.showStatus == "live" && !s.instagramHandle.isNullOrBlank()) {
+                    SessionBridge.sync(prefs, web) { handoff(s) }
+                }
+            }
+        }
+    }
+
+    private fun handoff(s: WidgetState) {
+        if (handedOff.contains(s.showId)) return
         if (!Settings.canDrawOverlays(this)) {
-            toast("Turn on \"Display over other apps\" for SellCraz Live, then come back and tap Start again")
-            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+            pendingHandoff = s
+            AlertDialog.Builder(this)
+                .setTitle("Bidding for this show is on Instagram")
+                .setMessage(
+                    "SellCraz shows a small bid card on top of Instagram. " +
+                        "Turn on \"Display over other apps\" for SellCraz on the next screen.\n\n" +
+                        "If Android says access was denied: Settings > Apps > SellCraz > ⋮ > " +
+                        "Allow restricted settings, then try again."
+                )
+                .setPositiveButton("Open settings") { _, _ ->
+                    startActivity(
+                        Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+                    )
+                }
+                .setNegativeButton("Not now", null)
+                .show()
             return
         }
+        handedOff.add(s.showId)
 
-        if (prefs.accessToken == null) toast("Not signed in: the widget will show prices but can't bid")
-        startForegroundService(Intent(this, OverlayService::class.java).putExtra(OverlayService.EXTRA_LOT_ID, id))
-        toast("Widget is on. Open Instagram.")
-    }
+        val isHost = prefs.userId != null && prefs.userId == s.sellerId
+        startForegroundService(
+            Intent(this, OverlayService::class.java)
+                .putExtra(OverlayService.EXTRA_SHOW_ID, s.showId)
+                .putExtra(OverlayService.EXTRA_HOST, isHost)
+        )
 
-    private fun stopWidget() {
-        stopService(Intent(this, OverlayService::class.java))
-    }
-
-    private fun openInstagram() {
-        val i = packageManager.getLaunchIntentForPackage("com.instagram.android")
-        if (i == null) toast("Instagram isn't installed") else startActivity(i)
-    }
-
-    // ---------------------------------------------------------------- ui helpers
-
-    private fun dp(v: Int): Int =
-        TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics).toInt()
-
-    private fun heading(t: String, size: Float) {
-        col.addView(TextView(this).apply {
-            text = t
-            textSize = size
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, dp(20), 0, dp(6))
-        })
-    }
-
-    private fun para(t: String): TextView {
-        val v = TextView(this).apply {
-            text = t
-            textSize = 14f
-            setPadding(0, dp(4), 0, dp(4))
+        if (isHost) {
+            Toast.makeText(this, "In Instagram, tap + then Live to start your broadcast", Toast.LENGTH_LONG).show()
+        } else if (!prefs.hasFreshSession()) {
+            Toast.makeText(this, "Log in to SellCraz to bid", Toast.LENGTH_LONG).show()
         }
-        col.addView(v)
-        return v
+        openInstagram(s.instagramHandle ?: return)
     }
 
-    private fun field(label: String, value: String, type: Int): EditText {
-        col.addView(TextView(this).apply {
-            text = label
-            textSize = 12f
-            alpha = 0.7f
-            setPadding(0, dp(8), 0, 0)
-        })
-        val e = EditText(this).apply {
-            setText(value)
-            inputType = type
-            isSingleLine = true
+    private fun openInstagram(handle: String) {
+        val uri = Uri.parse("https://www.instagram.com/$handle/")
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, uri).setPackage("com.instagram.android"))
+        } catch (e: ActivityNotFoundException) {
+            startActivity(Intent(Intent.ACTION_VIEW, uri))
         }
-        col.addView(e)
-        return e
     }
 
-    private fun buttonRow(vararg buttons: Pair<String, () -> Unit>) {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, dp(6), 0, 0)
+    // ---------------------------------------------------------------- web plumbing
+
+    private inner class ShellClient : WebViewClient() {
+        override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+            val uri = request.url
+            val siteHost = Uri.parse(prefs.siteUrl).host ?: ""
+            val host = uri.host ?: ""
+            val ours = host == siteHost || host.endsWith("." + siteHost.removePrefix("www.")) ||
+                host == siteHost.removePrefix("www.")
+            if (ours && (uri.scheme == "https" || uri.scheme == "http")) return false
+            return try {
+                startActivity(Intent(Intent.ACTION_VIEW, uri))
+                true
+            } catch (e: ActivityNotFoundException) {
+                true
+            }
         }
-        buttons.forEachIndexed { i, (label, action) ->
-            row.addView(Button(this).apply {
-                text = label
-                isAllCaps = false
-                setOnClickListener { action() }
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    if (i > 0) marginStart = dp(8)
-                }
-            })
+
+        override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+            onUrl(url)
         }
-        col.addView(row)
+
+        override fun onPageFinished(view: WebView, url: String?) {
+            SessionBridge.sync(prefs, view)
+            onUrl(url)
+        }
+
+        // Next.js navigates with pushState, which does not trigger onPageStarted.
+        override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
+            onUrl(url)
+        }
     }
 
-    private fun toast(t: String) {
-        Toast.makeText(this, t, Toast.LENGTH_LONG).show()
+    private inner class ShellChrome : WebChromeClient() {
+        // File inputs: avatar upload, KYC documents, CSV import.
+        override fun onShowFileChooser(
+            webView: WebView,
+            callback: ValueCallback<Array<Uri>>,
+            params: FileChooserParams
+        ): Boolean {
+            fileCallback?.onReceiveValue(null)
+            fileCallback = callback
+            return try {
+                startActivityForResult(params.createIntent(), REQ_FILE)
+                true
+            } catch (e: ActivityNotFoundException) {
+                fileCallback = null
+                false
+            }
+        }
+
+        // Camera and microphone for going live on SellCraz itself (LiveKit).
+        override fun onPermissionRequest(request: PermissionRequest) {
+            val siteHost = Uri.parse(prefs.siteUrl).host
+            if (request.origin.host != siteHost) {
+                request.deny()
+                return
+            }
+            val need = ArrayList<String>()
+            if (request.resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE)) need.add(Manifest.permission.CAMERA)
+            if (request.resources.contains(PermissionRequest.RESOURCE_AUDIO_CAPTURE)) need.add(Manifest.permission.RECORD_AUDIO)
+            val missing = need.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+            if (missing.isEmpty()) {
+                request.grant(request.resources)
+            } else {
+                pendingWebPermission = request
+                requestPermissions(missing.toTypedArray(), REQ_MEDIA)
+            }
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == REQ_FILE) {
+            fileCallback?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data))
+            fileCallback = null
+            return
+        }
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        if (requestCode == REQ_MEDIA) {
+            val req = pendingWebPermission ?: return
+            pendingWebPermission = null
+            if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+                req.grant(req.resources)
+            } else {
+                req.deny()
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        io.shutdownNow()
+        web.destroy()
+        super.onDestroy()
     }
 }

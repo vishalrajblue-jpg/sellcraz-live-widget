@@ -2,71 +2,32 @@ package com.sellcraz.livewidget
 
 import android.content.Context
 
-/** Everything the app remembers between launches. */
+/** What the app remembers. The session is copied in from the website. */
 class Prefs(context: Context) {
     private val p = context.applicationContext
-        .getSharedPreferences("sellcraz_widget", Context.MODE_PRIVATE)
+        .getSharedPreferences("sellcraz_app", Context.MODE_PRIVATE)
 
-    private fun str(key: String, def: String): String =
-        p.getString(key, null)?.takeIf { it.isNotBlank() } ?: def
-
-    private fun put(key: String, v: String?) {
-        p.edit().putString(key, v).apply()
-    }
-
-    var supabaseUrl: String
-        get() = str("url", BuildConfig.SUPABASE_URL).trim().trimEnd('/')
-        set(v) = put("url", v.trim().trimEnd('/'))
-
-    var anonKey: String
-        get() = str("anon", BuildConfig.SUPABASE_ANON_KEY).trim()
-        set(v) = put("anon", v.trim())
+    val siteUrl: String get() = BuildConfig.SITE_URL.trimEnd('/')
+    val supabaseUrl: String get() = BuildConfig.SUPABASE_URL.trimEnd('/')
+    val anonKey: String get() = BuildConfig.SUPABASE_ANON_KEY
 
     var accessToken: String?
         get() = p.getString("at", null)
-        set(v) = put("at", v)
-
-    var refreshToken: String?
-        get() = p.getString("rt", null)
-        set(v) = put("rt", v)
+        set(v) = p.edit().putString("at", v).apply()
 
     var userId: String?
         get() = p.getString("uid", null)
-        set(v) = put("uid", v)
+        set(v) = p.edit().putString("uid", v).apply()
 
-    var email: String?
-        get() = p.getString("email", null)
-        set(v) = put("email", v)
+    var tokenExpMs: Long
+        get() = p.getLong("exp", 0L)
+        set(v) = p.edit().putLong("exp", v).apply()
 
-    var lotId: String?
-        get() = p.getString("lot", null)
-        set(v) = put("lot", v)
+    /** True when there is a token that is not about to expire. */
+    fun hasFreshSession(marginMs: Long = 30_000): Boolean =
+        accessToken != null && tokenExpMs > System.currentTimeMillis() + marginMs
 
-    // Schema knobs. Defaults are best guesses; change in the app's Advanced
-    // section if the database uses different names. No rebuild needed.
-    var lotTable: String
-        get() = str("lot_table", "lots")
-        set(v) = put("lot_table", v.trim())
-
-    var rpcName: String
-        get() = str("rpc", "place_bid")
-        set(v) = put("rpc", v.trim())
-
-    var lotParam: String
-        get() = str("lot_param", "p_lot_id")
-        set(v) = put("lot_param", v.trim())
-
-    var amountParam: String
-        get() = str("amount_param", "p_amount")
-        set(v) = put("amount_param", v.trim())
-
-    var defaultIncrement: Long
-        get() = str("inc", "50").toLongOrNull()?.takeIf { it > 0 } ?: 50L
-        set(v) = put("inc", v.toString())
-
-    fun signOut() {
-        accessToken = null
-        refreshToken = null
-        userId = null
+    fun clearSession() {
+        p.edit().remove("at").remove("uid").remove("exp").apply()
     }
 }

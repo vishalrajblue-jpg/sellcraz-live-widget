@@ -1,160 +1,84 @@
 package com.sellcraz.livewidget
 
-import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
-import java.net.URLEncoder
 
 class ApiException(val code: Int, message: String) : Exception(message)
 
-class Resp(val code: Int, val body: String, val serverTimeMs: Long?, val localTimeMs: Long)
+/** Thrown when the copied website session has expired. Fix: open the app. */
+class SessionExpiredException : Exception("Session expired. Tap ↗ to open SellCraz, then come back.")
 
-class LotFetch(val json: JSONObject, val serverTimeMs: Long?, val localTimeMs: Long)
+class RpcResult(val body: String, val localTimeMs: Long)
 
 /**
- * Minimal Supabase client: GoTrue password login + PostgREST.
- * Blocking calls, so only ever call from a background thread.
+ * PostgREST RPC calls only. Blocking: background threads only.
+ * The app never refreshes tokens itself. Refreshing rotates the refresh
+ * token, and doing that behind the website's back can log the user out of
+ * both. The website refreshes its own session whenever it is open, and the
+ * app copies it (see SessionBridge).
  */
 class SupabaseApi(private val prefs: Prefs) {
 
-    fun signIn(email: String, password: String) {
-        val body = JSONObject().put("email", email).put("password", password).toString()
-        val r = request("POST", "/auth/v1/token?grant_type=password", body, useUserToken = false)
-        if (r.code !in 200..299) throw ApiException(r.code, errorMessage(r.body))
-        storeSession(JSONObject(r.body))
-        prefs.email = email
+    fun widgetState(showId: String): WidgetState {
+        val r = rpc("show_widget_state", JSONObject().put("p_show", showId), requireUser = false)
+        return WidgetState.parse(JSONObject(r.body), r.localTimeMs)
     }
 
-    /** Code login, step 1: Supabase sends a one-time code by email or SMS. */
-    fun sendOtp(identity: String) {
-        val body = JSONObject().put("create_user", false)
-        if (identity.contains('@')) body.put("email", identity) else body.put("phone", identity)
-        val r = request("POST", "/auth/v1/otp", body.toString(), useUserToken = false)
-        if (r.code !in 200..299) throw ApiException(r.code, errorMessage(r.body))
+    fun placeBid(lotId: String, amount: Long) {
+        rpc("place_bid", JSONObject().put("p_lot", lotId).put("p_amount", amount), requireUser = true)
     }
 
-    /** Code login, step 2: swap the code for a session. */
-    fun verifyOtp(identity: String, code: String) {
-        val isEmail = identity.contains('@')
-        val body = JSONObject()
-            .put("type", if (isEmail) "email" else "sms")
-            .put(if (isEmail) "email" else "phone", identity)
-            .put("token", code)
-        val r = request("POST", "/auth/v1/verify", body.toString(), useUserToken = false)
-        if (r.code !in 200..299) throw ApiException(r.code, errorMessage(r.body))
-        storeSession(JSONObject(r.body))
-        prefs.email = identity
+    fun advanceLot(showId: String): WidgetState {
+        val r = rpc("seller_advance_lot", JSONObject().put("p_show", showId), requireUser = true)
+        return WidgetState.parse(JSONObject(r.body), r.localTimeMs)
     }
 
-    private fun refreshSession(): Boolean {
-        val rt = prefs.refreshToken ?: return false
-        val body = JSONObject().put("refresh_token", rt).toString()
-        val r = try {
-            request("POST", "/auth/v1/token?grant_type=refresh_token", body, useUserToken = false)
-        } catch (e: Exception) {
-            return false
-        }
-        if (r.code !in 200..299) return false
-        storeSession(JSONObject(r.body))
-        return true
+    fun closeLotNow(lotId: String) {
+        rpc("force_close_auction", JSONObject().put("p_lot", lotId), requireUser = true)
     }
 
-    private fun storeSession(o: JSONObject) {
-        prefs.accessToken = o.optString("access_token").takeIf { it.isNotBlank() }
-        prefs.refreshToken = o.optString("refresh_token").takeIf { it.isNotBlank() }
-        val uid = o.optJSONObject("user")?.optString("id")
-        if (!uid.isNullOrBlank()) prefs.userId = uid
+    fun endShow(showId: String) {
+        rpc("end_show", JSONObject().put("p_show", showId), requireUser = true)
     }
 
-    fun fetchLot(lotId: String): LotFetch {
-        val path = "/rest/v1/${enc(prefs.lotTable)}?id=eq.${enc(lotId)}&select=*"
-        val r = authed("GET", path, null)
-        if (r.code !in 200..299) throw ApiException(r.code, errorMessage(r.body))
-        val arr = JSONArray(r.body)
-        if (arr.length() == 0) throw ApiException(404, "Lot not found, or this account can't see it")
-        return LotFetch(arr.getJSONObject(0), r.serverTimeMs, r.localTimeMs)
-    }
+    private fun rpc(name: String, args: JSONObject, requireUser: Boolean): RpcResult {
+        val token = if (prefs.hasFreshSession(5_000)) prefs.accessToken else null
+        if (requireUser && token == null) throw SessionExpiredException()
 
-    /** Calls the same place_bid RPC the web app uses. Returns the raw response body. */
-    fun placeBid(lotId: String, amount: Long): String {
-        val body = JSONObject()
-            .put(prefs.lotParam, lotId)
-            .put(prefs.amountParam, amount)
-            .toString()
-        val r = authed("POST", "/rest/v1/rpc/${enc(prefs.rpcName)}", body)
-        if (r.code !in 200..299) throw ApiException(r.code, errorMessage(r.body))
-        val t = r.body.trim()
-        // Some RPCs report failure as {"ok": false, "error": "..."} with HTTP 200.
-        if (t.startsWith("{")) {
-            val o = JSONObject(t)
-            if (o.has("ok") && !o.optBoolean("ok", true)) {
-                throw ApiException(r.code, clean(o.optString("error")) ?: clean(o.optString("message")) ?: "Bid rejected")
-            }
-            val err = clean(o.optString("error"))
-            if (err != null) throw ApiException(r.code, err)
-        }
-        return t
-    }
-
-    private fun authed(method: String, path: String, body: String?): Resp {
-        var r = request(method, path, body, useUserToken = true)
-        if (r.code == 401 && refreshSession()) r = request(method, path, body, useUserToken = true)
-        return r
-    }
-
-    private fun request(method: String, path: String, body: String?, useUserToken: Boolean): Resp {
-        val base = prefs.supabaseUrl
-        val key = prefs.anonKey
-        if (base.isBlank() || key.isBlank()) {
-            throw ApiException(0, "Supabase URL or anon key missing (see Connect in the app)")
-        }
-        val c = URL(base + path).openConnection() as HttpURLConnection
+        val c = URL("${prefs.supabaseUrl}/rest/v1/rpc/$name").openConnection() as HttpURLConnection
         try {
-            c.requestMethod = method
+            c.requestMethod = "POST"
             c.connectTimeout = 8000
             c.readTimeout = 8000
-            c.setRequestProperty("apikey", key)
-            val bearer = if (useUserToken) prefs.accessToken ?: key else key
-            c.setRequestProperty("Authorization", "Bearer $bearer")
+            c.doOutput = true
+            c.setRequestProperty("apikey", prefs.anonKey)
+            c.setRequestProperty("Authorization", "Bearer ${token ?: prefs.anonKey}")
+            c.setRequestProperty("Content-Type", "application/json")
             c.setRequestProperty("Accept", "application/json")
-            if (body != null) {
-                c.doOutput = true
-                c.setRequestProperty("Content-Type", "application/json")
-                c.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-            }
+            c.outputStream.use { it.write(args.toString().toByteArray(Charsets.UTF_8)) }
             val code = c.responseCode
             val now = System.currentTimeMillis()
             val stream = if (code in 200..299) c.inputStream else c.errorStream
             val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
-            val date = c.getHeaderFieldDate("Date", 0L)
-            return Resp(code, text, if (date > 0) date else null, now)
+            if (code == 401 || text.contains("JWT expired")) {
+                if (requireUser) throw SessionExpiredException()
+            }
+            if (code !in 200..299) throw ApiException(code, errorMessage(text))
+            return RpcResult(text, now)
         } finally {
             c.disconnect()
         }
     }
 
     companion object {
-        private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
+        private fun clean(s: String?): String? = s?.takeIf { it.isNotBlank() && it != "null" }
 
-        private fun clean(s: String?): String? =
-            s?.takeIf { it.isNotBlank() && it != "null" }
-
-        /** Turns a Supabase error body into something readable on a phone. */
-        fun errorMessage(body: String): String {
-            return try {
-                val o = JSONObject(body)
-                val main = listOf("message", "msg", "error_description", "error")
-                    .firstNotNullOfOrNull { clean(o.optString(it)) }
-                val hint = clean(o.optString("hint"))
-                when {
-                    main != null && hint != null -> "$main ($hint)"
-                    main != null -> main
-                    else -> body.take(200)
-                }
-            } catch (e: Exception) {
-                body.take(200).ifBlank { "Request failed" }
-            }
+        fun errorMessage(body: String): String = try {
+            val o = JSONObject(body)
+            clean(o.optString("message")) ?: clean(o.optString("error")) ?: body.take(160)
+        } catch (e: Exception) {
+            body.take(160).ifBlank { "Request failed" }
         }
     }
 }
