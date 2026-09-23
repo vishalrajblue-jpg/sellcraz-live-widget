@@ -60,10 +60,11 @@ class MainActivity : Activity() {
         urlIn = field("Supabase URL", prefs.supabaseUrl, InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
         anonIn = field("Supabase anon key", prefs.anonKey, InputType.TYPE_CLASS_TEXT)
         emailIn = field(
-            "Email", prefs.email ?: "",
+            "Email or phone", prefs.email ?: "",
             InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS
         )
-        passIn = field("Password", "", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
+        buttonRow("Send code" to { sendCode() })
+        passIn = field("Login code", "", InputType.TYPE_CLASS_NUMBER)
         buttonRow(
             "Sign in" to { signIn() },
             "Sign out" to { prefs.signOut(); updateAuthStatus() }
@@ -126,18 +127,47 @@ class MainActivity : Activity() {
         incIn.text.toString().toLongOrNull()?.let { prefs.defaultIncrement = it }
     }
 
+    private fun identity(): String {
+        val t = emailIn.text.toString().trim()
+        if (t.contains('@')) return t
+        val digits = t.filter { it.isDigit() }
+        return when {
+            digits.length == 10 -> "+91$digits"
+            digits.length == 12 && digits.startsWith("91") -> "+$digits"
+            else -> t
+        }
+    }
+
+    private fun sendCode() {
+        saveConnection()
+        val id = identity()
+        if (id.isEmpty()) {
+            toast("Enter your email or phone")
+            return
+        }
+        authStatus.text = "Sending code…"
+        Thread {
+            try {
+                api.sendOtp(id)
+                runOnUiThread { authStatus.text = "Code sent to $id. Enter it above and tap Sign in." }
+            } catch (e: Exception) {
+                runOnUiThread { authStatus.text = "Couldn't send code: ${e.message}" }
+            }
+        }.start()
+    }
+
     private fun signIn() {
         saveConnection()
-        val email = emailIn.text.toString().trim()
-        val pass = passIn.text.toString()
-        if (email.isEmpty() || pass.isEmpty()) {
-            toast("Enter email and password")
+        val id = identity()
+        val code = passIn.text.toString().trim()
+        if (id.isEmpty() || code.isEmpty()) {
+            toast("Enter your email or phone and the code")
             return
         }
         authStatus.text = "Signing in…"
         Thread {
             try {
-                api.signIn(email, pass)
+                api.verifyOtp(id, code)
                 runOnUiThread {
                     passIn.setText("")
                     updateAuthStatus()

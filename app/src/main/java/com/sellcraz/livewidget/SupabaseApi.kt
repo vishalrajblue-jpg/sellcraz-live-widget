@@ -26,6 +26,27 @@ class SupabaseApi(private val prefs: Prefs) {
         prefs.email = email
     }
 
+    /** Code login, step 1: Supabase sends a one-time code by email or SMS. */
+    fun sendOtp(identity: String) {
+        val body = JSONObject().put("create_user", false)
+        if (identity.contains('@')) body.put("email", identity) else body.put("phone", identity)
+        val r = request("POST", "/auth/v1/otp", body.toString(), useUserToken = false)
+        if (r.code !in 200..299) throw ApiException(r.code, errorMessage(r.body))
+    }
+
+    /** Code login, step 2: swap the code for a session. */
+    fun verifyOtp(identity: String, code: String) {
+        val isEmail = identity.contains('@')
+        val body = JSONObject()
+            .put("type", if (isEmail) "email" else "sms")
+            .put(if (isEmail) "email" else "phone", identity)
+            .put("token", code)
+        val r = request("POST", "/auth/v1/verify", body.toString(), useUserToken = false)
+        if (r.code !in 200..299) throw ApiException(r.code, errorMessage(r.body))
+        storeSession(JSONObject(r.body))
+        prefs.email = identity
+    }
+
     private fun refreshSession(): Boolean {
         val rt = prefs.refreshToken ?: return false
         val body = JSONObject().put("refresh_token", rt).toString()
